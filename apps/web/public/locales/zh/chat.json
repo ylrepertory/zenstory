@@ -48,7 +48,8 @@
     "roundSavedFilesMore": "{{files}}等 {{total}} 个文件",
     "creatingSession": "正在创建新对话",
     "newSessionFailed": "没能创建新对话，请重试",
-    "sessionRecoveryFailed": "对话暂时没能加载，请重试"
+    "sessionRecoveryFailed": "对话暂时没能加载，请重试",
+    "readWrittenFiles": "看正文"
   },
   "input": {
     "placeholder": "想写什么，直接说",
@@ -345,7 +346,8 @@
   },
   "activity": {
     "elapsed": "AI 正在处理 · {{seconds}} 秒",
-    "longWaitHint": "写长内容可能要几分钟，请稍等。"
+    "longWaitHint": "写长内容可能要几分钟，请稍等。",
+    "longWaitHintMobile": "写长内容可能要几分钟，请保持页面打开。"
   },
   "leaveWhileGenerating": {
     "title": "AI 还在写",
@@ -393,5 +395,21 @@
       "label": "写第 1 集剧本",
       "message": "按分集大纲写第 1 集剧本"
     }
+  },
+  "starter": {
+    "label": "开始第一段对话",
+    "greeting": {
+      "title": "嗨，我是你的写作搭档。",
+      "body": "说个点子，一句话就够，我先帮你写开头。"
+    },
+    "example": {
+      "hint": "还没想好？试试这个：",
+      "novel": "架空权谋：穿越成最不起眼的六皇子，只想悄悄攒兵权自保，却被父皇和兄长一步步推到台前。",
+      "short": "反转短篇：高考那天，刚出狱的影后妈妈在校门口向女儿下跪，只有女儿知道她为什么入狱。",
+      "screenplay": "竖屏短剧：神医弟子下山完婚，被未婚妻当众撕了婚书，转身娶了她的姐姐。",
+      "use": "就写这个",
+      "edit": "我来改改"
+    },
+    "quota": "今天还能免费发 {{count}} 条"
   }
 }

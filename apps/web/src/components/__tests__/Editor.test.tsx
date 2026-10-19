@@ -109,6 +109,7 @@ vi.mock('../../lib/api', () => ({
     getTree: vi.fn(),
     create: vi.fn(),
     update: vi.fn(),
+    uploadDraft: vi.fn(),
   },
   fileVersionApi: {
     getVersions: vi.fn(),
@@ -158,10 +159,12 @@ vi.mock('../../contexts/MaterialAttachmentContext', () => ({
   MaterialAttachmentProvider: ({ children }: { children: React.ReactNode }) => React.createElement(React.Fragment, null, children),
 }))
 
-const viewport = vi.hoisted(() => ({ isMobile: false }))
+const viewport = vi.hoisted(() => ({ isMobile: false, switchToChat: vi.fn(), focusChatInput: vi.fn() }))
 vi.mock('../../contexts/MobileLayoutContext', () => ({
   useMobileLayout: () => ({
     isMobile: viewport.isMobile,
+    switchToChat: viewport.switchToChat,
+    focusChatInput: viewport.focusChatInput,
   }),
   MobileLayoutProvider: ({ children }: { children: React.ReactNode }) => React.createElement(React.Fragment, null, children),
 }))
@@ -369,6 +372,70 @@ describe('Editor', () => {
     mockProjectContext = createMockProjectContext({ selectedItem: null })
     render(<Editor />)
     expect(screen.getByText(/Tip: Use the AI assistant/i)).toBeInTheDocument()
+  })
+
+  it('imports a draft from the empty state and opens its first chapter without asking the AI', async () => {
+    vi.mocked(api.fileApi.uploadDraft).mockResolvedValueOnce({
+      files: [{ id: 'chapter-1', title: '第一章', file_type: 'draft' }] as never, total: 1, errors: [],
+    })
+    mockProjectContext = createMockProjectContext({ selectedItem: null })
+    render(<Editor />)
+
+    const file = new File(['第一章\n正文'], 'draft.md', { type: 'text/markdown' })
+    fireEvent.change(screen.getByTestId('empty-state-import-input'), { target: { files: [file] } })
+
+    await waitFor(() => expect(mockProjectContext.setSelectedItem).toHaveBeenCalledWith({ id: 'chapter-1', title: '第一章', type: 'draft' }))
+    expect(api.fileApi.uploadDraft).toHaveBeenCalledWith('project-1', file)
+    expect(mockProjectContext.triggerFileTreeRefresh).toHaveBeenCalled()
+  })
+
+  it('opens the import picker from the empty state and ignores a cancelled pick', () => {
+    mockProjectContext = createMockProjectContext({ selectedItem: null })
+    render(<Editor />)
+    const input = screen.getByTestId('empty-state-import-input') as HTMLInputElement
+    const pick = vi.spyOn(input, 'click')
+
+    fireEvent.click(screen.getByTestId('empty-state-import-drafts'))
+    fireEvent.change(input, { target: { files: null } })
+
+    expect(pick).toHaveBeenCalledTimes(1)
+    expect(api.fileApi.uploadDraft).not.toHaveBeenCalled()
+  })
+
+  it('leaves the newly opened work alone when an import finishes after the author switched works', async () => {
+    let finish!: (value: unknown) => void
+    vi.mocked(api.fileApi.uploadDraft).mockReturnValueOnce(new Promise((resolve) => { finish = resolve }) as never)
+    mockProjectContext = createMockProjectContext({ selectedItem: null })
+    const UnmemoizedEditor = (Editor as unknown as { type: React.ComponentType }).type
+    const { rerender } = render(<UnmemoizedEditor />)
+
+    fireEvent.change(screen.getByTestId('empty-state-import-input'), { target: { files: [new File(['第一章'], 'draft.md')] } })
+    const setSelectedItem = mockProjectContext.setSelectedItem
+    const triggerFileTreeRefresh = mockProjectContext.triggerFileTreeRefresh
+    mockProjectContext = { ...mockProjectContext, currentProjectId: 'project-2' }
+    rerender(<UnmemoizedEditor />)
+    finish({ files: [{ id: 'chapter-1', title: '第一章', file_type: 'draft' }], total: 1, errors: [] })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(setSelectedItem).not.toHaveBeenCalled()
+    expect(triggerFileTreeRefresh).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['desktop', false, 'focusChatInput'],
+    ['phone', true, 'switchToChat'],
+  ] as const)('opens the chat from the empty-state AI hint on %s', (_name, isMobile, expected) => {
+    viewport.isMobile = isMobile
+    viewport.switchToChat.mockClear()
+    viewport.focusChatInput.mockClear()
+    mockProjectContext = createMockProjectContext({ selectedItem: null })
+    render(<Editor />)
+
+    fireEvent.click(screen.getByTestId('empty-state-ask-ai'))
+
+    // Phones switch panels without raising the keyboard over the starter cards.
+    expect(viewport[expected]).toHaveBeenCalledTimes(1)
+    expect(viewport[expected === 'switchToChat' ? 'focusChatInput' : 'switchToChat']).not.toHaveBeenCalled()
   })
 
   it('renders keyboard shortcut hint in empty state', () => {
