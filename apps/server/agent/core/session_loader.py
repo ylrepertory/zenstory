@@ -48,12 +48,14 @@ _BREADCRUMB_VERBS_ZH = {
     "create_file": "已创建文件",
     "edit_file": "已编辑文件",
     "delete_file": "已删除文件",
+    "rename_file": "已改名文件",
     "query_files": "已读取文件",
 }
 _BREADCRUMB_VERBS_EN = {
     "create_file": "Created file",
     "edit_file": "Edited file",
     "delete_file": "Deleted file",
+    "rename_file": "Renamed file",
     "query_files": "Read file",
 }
 _FAILED_TOOL_STATUSES = {"error", "failed", "failure"}
@@ -593,7 +595,10 @@ class SessionLoader:
             lines.extend(in_context)
             lines.append("")
         if omitted:
-            lines.append("未附全文（超出工作集预算；确需全文时再用 query_files(id=…) 读取一次）：")
+            lines.append(
+                "未附全文（超出工作集预算；只需结尾或某一章时用 query_files(id=…, tail_chars=… / section=…) "
+                "读那一段，确需全文时再按 id 读取一次）："
+            )
             lines.extend(omitted)
             lines.append("")
         lines.append("</previous_turn_working_set>")
@@ -972,7 +977,7 @@ class SessionLoader:
             if status in _FAILED_TOOL_STATUSES or tc.get("error"):
                 continue
 
-            if name in {"create_file", "edit_file", "delete_file"}:
+            if name in {"create_file", "edit_file", "delete_file", "rename_file"}:
                 actions.append(
                     {
                         "name": name,

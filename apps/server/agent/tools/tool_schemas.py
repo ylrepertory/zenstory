@@ -158,12 +158,37 @@ DELETE_FILE_TOOL: dict[str, Any] = {
     }
 }
 
+# Tool: rename_file
+RENAME_FILE_TOOL: dict[str, Any] = {
+    "name": "rename_file",
+    "description": (
+        "只修改文件标题（文件名），文件 id、正文、位置和版本历史都不变。"
+        "作者只要求改名时用它；不要为改名新建文件、复制或重写正文、再删除旧文件。"
+        "同一文件夹里已有同名文件时会被拒绝。结果只返回新旧标题，不返回正文。"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "要改名的文件 ID"},
+            "title": {
+                "type": "string",
+                "description": "新标题，最多 255 字；只写标题，不要把正文放进来",
+                "maxLength": 255,
+            },
+        },
+        "required": ["id", "title"],
+    },
+}
+
 # Tool: query_files
 QUERY_FILES_TOOL: dict[str, Any] = {
     "name": "query_files",
     "description": (
         "查询和搜索项目中的文件。按 id 读取默认返回全文（content）；列表/关键词查询默认返回 summary"
         "（content_preview + content_length + content_truncated，不含全文）。"
+        "长文件只需要其中一段时按范围读：section（章节/分集标题，如「第3章」）、tail_chars（结尾若干字，"
+        "续写只需前文结尾时用）或 start_char + max_chars；结果的 content_range / content_partial 说明读到了哪一段，"
+        "范围外的正文没有读到。作者要求通篇检查或改动牵涉全文时仍读全文。"
         "本轮已经读过的文件仍在上下文里，不要重复读取。"
         f"{WORD_COUNT_CONTRACT}"
     ),
@@ -224,6 +249,25 @@ QUERY_FILES_TOOL: dict[str, Any] = {
                 "description": "summary 模式下 content_preview 的最大字符数（显式传此参数表示要预览，不返回全文）",
                 "default": 200,
                 "minimum": 0
+            },
+            "section": {
+                "type": "string",
+                "description": "按 id 读取时只读这个章节/分集：标题文字，如「第3章」「第十集」「Chapter 3」；读到下一个同级标题为止",
+            },
+            "tail_chars": {
+                "type": "integer",
+                "description": "按 id 读取时只读正文最后这么多个字符（上限 20000）",
+                "minimum": 1,
+            },
+            "start_char": {
+                "type": "integer",
+                "description": "按 id 读取时从第几个字符开始读（从 0 起），配合 max_chars",
+                "minimum": 0,
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": "配合 start_char 读取的字符数（默认 6000，上限 20000）",
+                "minimum": 1,
             },
             "include_content": {
                 "type": "boolean",
@@ -491,6 +535,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "create_file": CREATE_FILE_TOOL,
     "edit_file": EDIT_FILE_TOOL,
     "delete_file": DELETE_FILE_TOOL,
+    "rename_file": RENAME_FILE_TOOL,
     "query_files": QUERY_FILES_TOOL,
     "update_project": UPDATE_PROJECT_TOOL,
     "handoff_to_agent": HANDOFF_TO_AGENT_TOOL,
