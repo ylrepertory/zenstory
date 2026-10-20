@@ -23,6 +23,7 @@ import { toast } from "../lib/toast";
 import { isFileTitleTooLong } from "../lib/fileTitle";
 import { logger } from "../lib/logger";
 import { FirstWorkGuidance } from "./FirstWorkGuidance";
+import { Button } from "./ui/Button";
 import { DRAFT_IMPORT_ACCEPT, useDraftImport } from "../hooks/useDraftImport";
 import { SimpleEditor } from "./SimpleEditor";
 import type { SaveOutcome, SaveResult, SaveSubmission } from "./SimpleEditor";
@@ -1379,7 +1380,10 @@ const EditorComponent: React.FC<EditorProps> = () => {
     const isScreenplay = currentProject?.project_type === 'screenplay';
     const primaryFileType: EmptyStateFileType = isScreenplay ? 'script' : 'draft';
     return renderWithUpgradeModal(
-      <div className="flex flex-col items-center justify-center h-full p-6 md:p-8 relative overflow-hidden">
+      // Centred while it fits; on a short window it scrolls from the top instead of pushing the
+      // heading under the header and the last hints out of reach.
+      <div className="h-full overflow-y-auto">
+      <div className="relative flex min-h-full flex-col items-center justify-center p-6 md:p-8 overflow-hidden">
         {/* Background ambient glow */}
         <div className="absolute inset-0 bg-gradient-to-br from-[hsl(var(--accent-primary)/0.03)] via-transparent to-[hsl(var(--accent-primary)/0.02)] pointer-events-none" />
 
@@ -1401,7 +1405,20 @@ const EditorComponent: React.FC<EditorProps> = () => {
             </p>
           </div>
 
-          {/* Primary Actions - 2 cards */}
+          {/* The view's one primary action: the chat, where an empty first conversation offers
+              starter cards. Phones switch panels without raising the keyboard over those cards. */}
+          <Button
+            type="button"
+            data-testid="empty-state-ask-ai"
+            size={isMobile ? 'touch' : 'md'}
+            className="w-full"
+            leftIcon={<Zap className="w-4 h-4" />}
+            onClick={isMobile ? switchToChat : focusChatInput}
+          >
+            {t('editor:emptyStateHint')}
+          </Button>
+
+          {/* Write it yourself - 2 cards */}
           <div className="grid grid-cols-2 gap-3">
             {/* Create Draft (screenplay projects: Script) */}
             <div
@@ -1507,20 +1524,6 @@ const EditorComponent: React.FC<EditorProps> = () => {
               <span>{t('editor:emptyStateImportDrafts')}</span>
             </button>
 
-            {/* AI Hint: opens the chat, where an empty first conversation offers starter cards.
-                Phones switch panels without raising the keyboard over those cards. */}
-            <button
-              type="button"
-              data-testid="empty-state-ask-ai"
-              onClick={isMobile ? switchToChat : focusChatInput}
-              className="mx-auto flex min-h-[44px] md:min-h-0 items-center justify-center gap-2 rounded-md px-2 py-1 text-xs text-[hsl(var(--text-secondary))] hover:text-[hsl(var(--text-primary))] group"
-            >
-              <span className="p-1.5 rounded-md bg-[hsl(var(--accent-primary)/0.08)] group-hover:bg-[hsl(var(--accent-primary)/0.12)] transition-colors">
-                <Zap className="w-3.5 h-3.5 text-[hsl(var(--accent-primary))]" />
-              </span>
-              <span>{t('editor:emptyStateHint')}</span>
-            </button>
-
             {/* Keyboard Shortcut Hint (no physical keyboard on phones) */}
             {!isMobile && (
               <div className="flex items-center justify-center gap-2 text-xs text-[hsl(var(--text-secondary))] group cursor-default">
@@ -1536,6 +1539,7 @@ const EditorComponent: React.FC<EditorProps> = () => {
             )}
           </div>
         </div>
+      </div>
       </div>
     );
   }

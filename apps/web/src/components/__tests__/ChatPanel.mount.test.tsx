@@ -1899,6 +1899,57 @@ describe('ChatPanel mount smoke', () => {
     expect(vi.mocked(fetchSuggestions)).not.toHaveBeenCalled()
   })
 
+  const REPLY_WITH_OPTIONS = '写好了第一章开头。\n\n想换个方向的话，可以回我一句：\n- 「主角改成女性」\n- 「开头先写一场宫宴」'
+
+  it('leads the chips with the options a finished reply ends with, then fills the rest with a step forward', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      withEarlierTurn()
+      render(<ChatPanel />)
+      await waitFor(() => expect(vi.mocked(fetchSuggestions)).toHaveBeenCalledTimes(1))
+      await waitFor(() => expect(capturedUseAgentStream.options).not.toBeNull())
+      let fill!: (suggestions: string[]) => void
+      vi.mocked(fetchSuggestions).mockReturnValueOnce(new Promise(resolve => { fill = resolve }))
+      mockStreamSnapshot.items = [{ type: 'content', id: 'reply', content: REPLY_WITH_OPTIONS, timestamp: new Date() }]
+
+      await act(async () => {
+        await roundOptions().onComplete([{ type: 'content', id: 'reply', content: REPLY_WITH_OPTIONS }], null)
+      })
+      await act(async () => { vi.advanceTimersByTime(1600) })
+
+      // The reply's own options are tappable at once …
+      await waitFor(() => expect(lastMessageInputProps().aiSuggestions).toEqual(['主角改成女性', '开头先写一场宫宴']))
+      // … and the model fills the last slot, skipping what the reply already offered.
+      await act(async () => { fill(['主角改成女性', '按设定写第二章正文', '先列前三章大纲']) })
+      await waitFor(() => expect(lastMessageInputProps().aiSuggestions).toEqual(['主角改成女性', '开头先写一场宫宴', '按设定写第二章正文']))
+      expect(JSON.parse(localStorage.getItem('zenstory_suggestions_cache_project-1')!).suggestions).toHaveLength(3)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('opens a chat whose last reply offered options with those options leading the chips', async () => {
+    vi.mocked(getRecentMessages).mockResolvedValueOnce([{
+      id: 'msg-options', session_id: 'session-1', role: 'assistant', content: REPLY_WITH_OPTIONS,
+      tool_calls: null, created_at: '2026-10-05T10:00:00Z', metadata: null,
+    }] as never)
+    vi.mocked(fetchSuggestions).mockResolvedValueOnce(['按设定写第二章正文'])
+    render(<ChatPanel />)
+
+    await waitFor(() => expect(lastMessageInputProps().aiSuggestions).toEqual(['主角改成女性', '开头先写一场宫宴', '按设定写第二章正文']))
+  })
+
+  it('keeps the offered options when the request for the rest fails', async () => {
+    vi.mocked(getRecentMessages).mockResolvedValueOnce([{
+      id: 'msg-options', session_id: 'session-1', role: 'assistant', content: REPLY_WITH_OPTIONS,
+      tool_calls: null, created_at: '2026-10-05T10:00:00Z', metadata: null,
+    }] as never)
+    vi.mocked(fetchSuggestions).mockResolvedValueOnce(null)
+    render(<ChatPanel />)
+
+    await waitFor(() => expect(vi.mocked(fetchSuggestions)).toHaveBeenCalledTimes(1))
+    expect(lastMessageInputProps().aiSuggestions).toEqual(['主角改成女性', '开头先写一场宫宴'])
+    expect(lastMessageInputProps().suggestionDisplayState).toBe('ready')
+  })
+
   it('uses local fallback only when the suggestion request fails', async () => {
     vi.mocked(fetchSuggestions).mockResolvedValueOnce(null)
     withEarlierTurn()
@@ -2094,9 +2145,9 @@ describe('ChatPanel new-author flow', () => {
   it('keeps following the bottom while loaded history finishes rendering, until the author touches the list', async () => {
     // Lazily rendered Markdown grows the list after the first scroll-to-bottom; reloads used to stop
     // one round short of the latest reply (2026-10-12 production audit).
-    const resizeCallbacks: Array<() => void> = []
+    const resizeCallbacks: Array<(entries: Array<{ target: Element }>) => void> = []
     vi.stubGlobal('ResizeObserver', class {
-      constructor(callback: () => void) { resizeCallbacks.push(callback) }
+      constructor(callback: (entries: Array<{ target: Element }>) => void) { resizeCallbacks.push(callback) }
       observe() {}
       disconnect() {}
     })
@@ -2108,15 +2159,57 @@ describe('ChatPanel new-author flow', () => {
       render(<ChatPanel />)
       await waitFor(() => expect(lastMessageListProps()?.messages).toHaveLength(2))
       expect(resizeCallbacks.length).toBeGreaterThan(0)
+      const content = screen.getByTestId('message-list').firstElementChild!
+      const contentGrows = () => act(() => resizeCallbacks.forEach((callback) => callback([{ target: content }])))
 
       mockScrollToBottom.mockClear()
-      act(() => resizeCallbacks.forEach((callback) => callback()))
+      contentGrows()
       expect(mockScrollToBottom).toHaveBeenCalledWith(false)
 
       // The author starts scrolling: later growth no longer drags the list down.
       fireEvent.wheel(screen.getByTestId('message-list'))
       mockScrollToBottom.mockClear()
-      act(() => resizeCallbacks.forEach((callback) => callback()))
+      contentGrows()
+      expect(mockScrollToBottom).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('keeps a reader at the bottom when the list gets shorter, e.g. when the chips appear above the input', async () => {
+    // Reopening a work: the chips row appeared after the first scroll-to-bottom and pushed the
+    // latest reply out of view (2026-10-20 new-user audit, 3 of 3 reopens).
+    const resize: Array<(entries: Array<{ target: Element }>) => void> = []
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: (entries: Array<{ target: Element }>) => void) { resize.push(callback) }
+      observe() {}
+      disconnect() {}
+    })
+    try {
+      vi.mocked(getRecentMessages).mockResolvedValueOnce([
+        { id: 'u-1', session_id: 'session-1', role: 'user', content: '写第一章', created_at: '2026-10-08T10:00:00Z' },
+        { id: 'a-1', session_id: 'session-1', role: 'assistant', content: '第一章写好了', created_at: '2026-10-08T10:01:00Z' },
+      ] as never)
+      render(<ChatPanel />)
+      await waitFor(() => expect(lastMessageListProps()?.messages).toHaveLength(2))
+      const scroller = screen.getByTestId('message-list')
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 2000 })
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 400 })
+      Object.defineProperty(scroller, 'scrollTop', { configurable: true, writable: true, value: 1600 })
+      fireEvent.scroll(scroller)
+      // History has settled (the author touched the list): content growth alone is no longer followed.
+      fireEvent.wheel(scroller)
+      const listShrinks = () => act(() => resize.forEach((callback) => callback([{ target: scroller }])))
+
+      mockScrollToBottom.mockClear()
+      listShrinks()
+      expect(mockScrollToBottom).toHaveBeenCalledWith(false)
+
+      // A reader who scrolled up to re-read is left where they are.
+      scroller.scrollTop = 0
+      fireEvent.scroll(scroller)
+      mockScrollToBottom.mockClear()
+      listShrinks()
       expect(mockScrollToBottom).not.toHaveBeenCalled()
     } finally {
       vi.unstubAllGlobals()
@@ -2465,6 +2558,32 @@ describe("ChatPanel starter cards in a work's first chat", () => {
     expect(mockDraft.saveDraft).toHaveBeenCalledWith(screen.getByTestId('starter-message-text').textContent)
     expect(mockLayout.focusChatInput).toHaveBeenCalledTimes(1)
     expect(mockStartStream).not.toHaveBeenCalled()
+  })
+
+  it('lights up the starter cards briefly when the author is sent to the chat', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const layout = mockLayout as typeof mockLayout & { chatFocusRequest?: number }
+    layout.chatFocusRequest = 0
+    try {
+      render(<ChatPanel />)
+      await screen.findByTestId('starter-cards')
+      const card = () => screen.getByTestId('starter-message-text').parentElement!
+      expect(card()).not.toHaveAttribute('data-highlighted')
+
+      // The empty editor's 「让 AI 帮你写开头」 asks the chat for focus. (The mocked layout hook is not
+      // a context, so a quota update stands in for the re-render the real provider would cause.)
+      layout.chatFocusRequest = 1
+      act(() => {
+        testQueryClient.setQueryData(['subscription-quota', 'test-user'], { ai_conversations: { used: 0, limit: 3, reset_at: null } })
+      })
+      await waitFor(() => expect(card()).toHaveAttribute('data-highlighted', 'true'))
+
+      await act(async () => { vi.advanceTimersByTime(2000) })
+      expect(card()).not.toHaveAttribute('data-highlighted')
+    } finally {
+      delete layout.chatFocusRequest
+      vi.useRealTimers()
+    }
   })
 
   it('tags the first typed message of a first chat as the first message', async () => {

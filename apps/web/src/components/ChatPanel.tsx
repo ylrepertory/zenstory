@@ -79,6 +79,7 @@ import { hasPendingInspiration } from "../lib/pendingInspiration";
 import { useNextStepDismissal } from "../hooks/useNextStepDismissal";
 import { duplicatesNextStep, latestRoundAwaitsReply } from "../lib/nextStep";
 import { fetchSuggestions, type QuotaRefundKind, type RemovedPlaceholderFile } from "../lib/agentApi";
+import { optionsOfferedInReply } from "../lib/replyOptions";
 import { parseUTCDate } from "../lib/dateUtils";
 import { ApiError } from "../lib/apiClient";
 import { handleApiError } from "../lib/errorHandler";
@@ -247,6 +248,8 @@ interface ChatPanelProps {}
 const keepUnsavedFile = (result: OpenEditorFlushResult): { keepFileIds: string[] } | undefined =>
   !result.saved && result.fileId ? { keepFileIds: [result.fileId] } : undefined;
 
+const STARTER_HIGHLIGHT_MS = 1600;
+const SUGGESTION_COUNT = 3;
 const CHAT_INPUT_PANEL_HEIGHT_KEY = "zenstory_chat_input_panel_height_px";
 const SUGGESTION_CACHE_KEY_PREFIX = "zenstory_suggestions_cache_";
 const SUGGESTION_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -462,6 +465,15 @@ const ChatPanelComponent: React.FC<ChatPanelProps> = () => {
     queryClient.setQueryData<QuotaResponse>(subscriptionQueryKeys.quotaLite(), restore);
   }, [queryClient]);
   const { isMobile, activePanel, chatFocusRequest, switchToEditor, focusChatInput } = useMobileLayout();
+  // Sent here by the empty editor's 「让 AI 帮你写开头」: focusing the input alone looked like nothing
+  // happened (2026-10-20 new-user audit), so the starter cards light up briefly as well.
+  const [settledChatFocusRequest, setSettledChatFocusRequest] = useState(chatFocusRequest);
+  const starterHighlighted = chatFocusRequest !== settledChatFocusRequest;
+  useEffect(() => {
+    if (!starterHighlighted) return;
+    const timer = window.setTimeout(() => setSettledChatFocusRequest(chatFocusRequest), STARTER_HIGHLIGHT_MS);
+    return () => window.clearTimeout(timer);
+  }, [chatFocusRequest, starterHighlighted]);
   const { attachedFileIds, attachedLibraryMaterials, clearMaterials } = useMaterialAttachment();
   const { quotes, clearQuotes } = useTextQuote();
 
@@ -835,28 +847,42 @@ const ChatPanelComponent: React.FC<ChatPanelProps> = () => {
   const fetchAndApplySuggestions = useCallback(async (
     projectId: string,
     sourceMessages: Message[],
-    options?: { allowFallback?: boolean }
+    options?: { allowFallback?: boolean; lead?: string[] }
   ): Promise<string[] | null> => {
+    // Options the last reply offered in the author's words lead, shown at once; the model fills
+    // the remaining slots, so a step forward ("write chapter 2") stays one tap away.
+    const lead = options?.lead ?? [];
+    const keepLead = () => {
+      writeSuggestionCache(projectId, lead);
+      return lead;
+    };
+    if (lead.length > 0) {
+      setAiSuggestions(lead);
+      setSuggestionDisplayState("ready");
+      if (lead.length >= SUGGESTION_COUNT) return keepLead();
+    }
     const allowed = await canRequestSuggestions(projectId);
     if (currentProjectIdRef.current !== projectId) return null;
     if (!allowed) {
-      setAiSuggestions([]);
+      setAiSuggestions(lead);
       setSuggestionDisplayState("ready");
-      return [];
+      return lead;
     }
-    const suggestions = await fetchSuggestions(projectId, toRecentMessages(sourceMessages), 3);
+    const fetched = await fetchSuggestions(projectId, toRecentMessages(sourceMessages), SUGGESTION_COUNT);
 
     // Ignore stale responses from previous projects/requests.
     if (currentProjectIdRef.current !== projectId) {
       return null;
     }
 
-    if (suggestions !== null) {
+    if (fetched !== null) {
+      const suggestions = [...lead, ...fetched.filter((item) => !lead.includes(item))].slice(0, SUGGESTION_COUNT);
       setAiSuggestions(suggestions);
       setSuggestionDisplayState("ready");
       writeSuggestionCache(projectId, suggestions);
       return suggestions;
     }
+    if (lead.length > 0) return keepLead();
 
     if (options?.allowFallback && aiSuggestionsRef.current.length === 0) {
       setSuggestionDisplayState("fallback");
@@ -878,6 +904,14 @@ const ChatPanelComponent: React.FC<ChatPanelProps> = () => {
       return;
     }
     const cached = readCachedSuggestions(projectId);
+    const lastLoaded = sourceMessages[sourceMessages.length - 1];
+    const offered = cached === null && lastLoaded?.role === "assistant"
+      ? optionsOfferedInReply(lastLoaded.content)
+      : null;
+    if (offered) {
+      await fetchAndApplySuggestions(projectId, sourceMessages, { lead: offered });
+      return;
+    }
 
     if (cached !== null) {
       // 有缓存就直接用，不再后台刷新：打开/切换项目不该凭空多打一次 /suggest。
@@ -1137,8 +1171,12 @@ const ChatPanelComponent: React.FC<ChatPanelProps> = () => {
           return;
         }
         lastAutoSuggestionKeyRef.current = suggestionKey;
+        const offered = lastMessage?.role === "assistant" ? optionsOfferedInReply(lastMessage.content) : null;
         try {
-          const result = await fetchAndApplySuggestions(currentProjectId, currentMessages, { allowFallback: true });
+          const result = await fetchAndApplySuggestions(currentProjectId, currentMessages, {
+            allowFallback: true,
+            lead: offered ?? undefined,
+          });
           if (currentProjectIdRef.current !== currentProjectId || lastAutoSuggestionKeyRef.current !== suggestionKey) return;
           const displayState = result === null && aiSuggestionsRef.current.length === 0 ? "fallback" : "ready";
           lastAutoSuggestionStateRef.current = displayState;
@@ -1679,12 +1717,17 @@ const ChatPanelComponent: React.FC<ChatPanelProps> = () => {
     const stopFollowing = () => {
       followLoadedHistoryUntilRef.current = 0;
     };
-    const observer = new ResizeObserver(() => {
-      if (shouldAutoScrollRef.current && performance.now() < followLoadedHistoryUntilRef.current) {
+    const observer = new ResizeObserver((entries) => {
+      if (!shouldAutoScrollRef.current) return;
+      // The list itself got shorter (the chips row appeared above the input after the first
+      // scroll-to-bottom): a reader at the bottom stays there, or the latest reply drops out of view.
+      const listResized = entries.some((entry) => entry.target === scrollEl);
+      if (listResized || performance.now() < followLoadedHistoryUntilRef.current) {
         messageListRef.current?.scrollToBottom(false);
       }
     });
     observer.observe(contentEl);
+    observer.observe(scrollEl);
     const interactions = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
     for (const type of interactions) {
       scrollEl.addEventListener(type, stopFollowing, { passive: true });
@@ -2487,6 +2530,7 @@ const ChatPanelComponent: React.FC<ChatPanelProps> = () => {
           ) : messages.length === 0 && !isStreaming && !isThinking && !(error && retryable) && sessionRecoveryError !== currentProjectId ? (
             showStarterCards ? (
               <StarterCards
+                highlighted={starterHighlighted}
                 projectType={currentProject?.project_type}
                 remainingToday={showDailyCount && aiMessageQuota ? Math.max(0, aiMessageQuota.limit - aiMessageQuota.used) : null}
                 onSend={handleStarterSend}
