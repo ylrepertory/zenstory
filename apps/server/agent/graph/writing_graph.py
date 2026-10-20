@@ -300,10 +300,10 @@ SCOPE_DIRECTIVE_NO_CONTENT = (
 def _build_scope_directive(
     routing_metadata: dict[str, Any] | None, *, agent_type: str | None = None
 ) -> str:
-    """把路由对用户范围的判断（read_only / write_content / scope）转成系统提示约束。
+    """把路由对用户范围的判断（read_only / write_content / scope）转成本次运行的系统指令约束。
 
     交接包和 handoff 文本只在交接时出现，而本轮第一个 agent 也需要知道范围，
-    因此统一走系统提示，由 nodes.run_streaming_agent 追加到每个 agent 的提示末尾。
+    因此统一由 nodes.build_agent_directive 放进每个 agent 运行的系统指令（输入最后一条消息）。
 
     agent_type 是这次要跑的 agent。「规划完成后直接交接 writer 写正文」只是写给规划类
     角色的：计划交接后的 writer、审稿人也读到它时，会把它当成「作者要正文」的事实，
@@ -824,12 +824,15 @@ def _review_payload_block(
     return f"{note}{excerpt}"
 
 
-def _collect_review_payload_text(file_ids: list[str]) -> str | None:
+def _collect_review_payload_text(file_ids: list[str], *, focus: str | None = None) -> str | None:
     """读本请求写过的正文（draft / script）落库后的内容，按写入顺序拼成送审内容。
 
     流式落库和 edit_file 会把半角引号规范成稿件风格，库里这份才是作者看到的正文；
     模型原始输出里那些已经修好的半角引号不能再送审。没有可用正文时返回 None。
     每个文件带系统标注的编辑器字数；长文件只附本请求改动的那一段（见 _review_payload_block）。
+
+    focus 是审稿人交回返修的意见：只附意见里点到（标题或 id）的文件，把预算留给要改的正文，
+    其余文件只列名。一个都没点到时照旧全附。
     """
     project_id = ToolContext.get_project_id()
     if not project_id or not file_ids:
@@ -857,14 +860,27 @@ def _collect_review_payload_text(file_ids: list[str]) -> str | None:
     if not ordered:
         return None
     prefix = ""
+    if focus:
+        # 批量写的多章平分 9000 字预算时，要改的那章只剩片段，返修 writer 只能再读一遍。
+        named = [
+            file_id for file_id in ordered
+            if file_id in focus or (files[file_id][0].strip() and files[file_id][0].strip() in focus)
+        ]
+        if named and len(named) < len(ordered):
+            skipped = "、".join(f"《{files[file_id][0]}》" for file_id in ordered if file_id not in named)
+            # 只是标题匹配：意见换了叫法（「第3章」对「第三章」）时也会落在这里，不能说「不用改」。
+            prefix = f"[审稿意见没有按标题提到 {skipped}，没有附上；意见要改其中的内容时按章节读那一段]\n\n"
+            ordered = named
     if len(ordered) > 1:
         counts = "、".join(f"《{files[file_id][0]}》{count_words(files[file_id][1])}" for file_id in ordered)
-        prefix = f"[本请求写过的正文（编辑器字数）：{counts}]\n\n"
-    sources = [
-        f'[来源 id={file_id} updated_at={files[file_id][2].isoformat()}；'
-        f"省略内容用 query_files(id={file_id}) 读取后再核对]"
-        for file_id in ordered
-    ]
+        prefix += f"[本请求写过的正文（编辑器字数）：{counts}]\n\n"
+    def source_line(file_id: str, whole: bool) -> str:
+        # 每份都写「省略内容用 query_files 读取」时，审稿人对已经附了全文的文件也会再读一遍。
+        tail = "以下是全文，不用再读取" if whole else f"省略内容用 query_files(id={file_id}) 按章节读取后再核对"
+        return f"[来源 id={file_id} updated_at={files[file_id][2].isoformat()}；{tail}]"
+
+    # 预算按较长的那种来源行预留，算完分配后再按实际是否附了全文写。
+    sources = [source_line(file_id, False) for file_id in ordered]
     available = REVIEW_PAYLOAD_MAX_CHARS - len(prefix) - sum(len(source) + 1 for source in sources)
     available -= 2 * (len(ordered) - 1)
     if available <= 0:
@@ -886,19 +902,21 @@ def _collect_review_payload_text(file_ids: list[str]) -> str | None:
         allocation = min(len(blocks[index]), available // (len(blocks) - rank))
         allocations[index] = allocation
         available -= allocation
-    return prefix + "\n\n".join(
-        source + "\n" + (_format_review_payload(block, max_chars=allocation) if allocation else "")
-        for source, block, allocation in zip(sources, blocks, allocations, strict=True)
-    )
+    parts = []
+    for file_id, block, allocation in zip(ordered, blocks, allocations, strict=True):
+        attached = _format_review_payload(block, max_chars=allocation) if allocation else ""
+        whole = attached.endswith(files[file_id][1].strip())
+        parts.append(source_line(file_id, whole) + "\n" + attached)
+    return prefix + "\n\n".join(parts)
 
 
-async def _review_payload_text(file_ids: list[str]) -> str | None:
+async def _review_payload_text(file_ids: list[str], *, focus: str | None = None) -> str | None:
     """在送审预算内读落库正文；读取失败或超时只记 WARNING，返回 None（退回模型输出）。"""
     if not file_ids:
         return None
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_collect_review_payload_text, list(file_ids)),
+            asyncio.to_thread(functools.partial(_collect_review_payload_text, list(file_ids), focus=focus)),
             timeout=REVIEW_AUTO_CHECK_TIMEOUT_SECONDS,
         )
     except TimeoutError:
@@ -937,6 +955,7 @@ _BODY_WORD_COUNT_NOTE = (
 _LENGTH_REQUIREMENT_NOTE = (
     "以上是作者在本会话或项目设定里说过的篇幅要求（后说的为准），不只是作者本轮原话："
     "逐章对照上面的实际字数判断够不够；说的是全篇还是单章看上下文。"
+    "实际字数在标出的达标区间内就算达标，不为篇幅返工。"
 )
 # writer 送审前写给作者的说明被丢掉了：审稿人的回复是作者看到的唯一总结。
 WRITER_CHAT_SUPERSEDED_NOTE = (
@@ -954,9 +973,10 @@ _WRITER_QUESTION_FOR_REVIEWER_NOTE = (
 _WRITER_QUESTION_FOR_REWORK_NOTE = "作者还没看到这个问题：改完后把它原样放在你回复的最后问作者。"
 # 返修时附上审稿对象的当前落库正文（与送审片段同一口径）。
 REWORK_CURRENT_TEXT_HEADER = (
-    "[返修对象当前正文] 以下是审稿时那份正文的当前落库版本（长文件只附改动所在的一段）；"
-    "改这里面的内容时直接逐字引用作为 edit_file 的 old/anchor，不必再读这一段；"
-    "要改的地方不在下面时再按范围读取。"
+    "[返修对象当前正文] 以下是审稿意见涉及的正文的当前落库版本（长文件只附改动所在的一段），"
+    "每个文件标了编辑器字数；改这里面的内容时直接逐字引用作为 edit_file 的 old/anchor，"
+    "不要再用 query_files 或 parallel_execute 读这些正文，改完的字数看 edit_file 返回的 new_word_count；"
+    "要改的地方不在下面时只按章节读那一段。"
 )
 WRITER_REWORK_AFTER_SUPERSEDED_NOTE = (
     "[作者看到的回复] 你送检前写给作者的说明作者没有看到。这次改完后的回复就是作者看到的"
@@ -1123,7 +1143,8 @@ def _format_length_requirements(items: list[str] | None, *, before_writing: bool
     lines = "\n".join(f"- {item}" for item in items)
     note = (
         "以上是作者原话与来源（后说的为准）；先区分全篇目标、单章目标和本轮范围再开写。"
-        "本轮未明确改变的历史要求仍适用；只写指定范围，逐章写够后用实际工具字数核对。"
+        "本轮未明确改变的历史要求仍适用；只写指定范围，逐章写到达标区间内，用实际工具字数核对；"
+        "差得不多时一次改写到位，不逐字增删。"
         if before_writing else _LENGTH_REQUIREMENT_NOTE
     )
     return f"\n\n{LENGTH_REQUIREMENT_HEADER}\n{lines}\n{note}"
@@ -1682,7 +1703,7 @@ async def run_writing_workflow_streaming(
             type=StreamEventType.ROUTER_THINKING,
             data={
                 "message": (
-                    "快速模式：直接进入生成..."
+                    "快速模式：正在理解你的要求..."
                     if generation_mode == "fast"
                     else "高质量模式：正在规划工作流..."
                     if generation_mode == "quality"
@@ -1702,8 +1723,10 @@ async def run_writing_workflow_streaming(
         ).strip().lower() in {"1", "true", "yes", "y", "on"}
 
         # Per-request override (driven by frontend generation_mode UI).
+        # 快速模式只关自动质检：路由照常跑，只读 / 范围 / 作品第一条消息这些判断都来自路由，
+        # 关掉路由会让作者的提问也落到有写权限的 writer 上。质检和返修才是这档模式省下的成本。
         if generation_mode == "fast":
-            router_strategy = "off"
+            router_strategy = "llm"
             enable_graph_auto_review = False
         elif generation_mode == "quality":
             router_strategy = "llm"
@@ -1745,7 +1768,7 @@ async def run_writing_workflow_streaming(
                     "routing_metadata": {
                         "agent_type": "writer",
                         "workflow_type": "quick",
-                        "reason": "generation_mode_fast" if generation_mode == "fast" else "router_off",
+                        "reason": "router_off",
                         "confidence": 0.0,
                     },
                 }
@@ -2008,7 +2031,9 @@ async def run_writing_workflow_streaming(
                         # 按当前落库版本重新附上同一份送审片段：逐字引用它做 edit_file 的 old/anchor（#275）。
                         rework_guard = _guard_from_state(state)
                         rework_ids = rework_guard.written_file_ids() if rework_guard else []
-                        rework_payload = await _review_payload_text(rework_ids) if rework_ids else None
+                        rework_payload = (
+                            await _review_payload_text(rework_ids, focus=handoff_context) if rework_ids else None
+                        )
                         if rework_payload:
                             rework_text = f"\n\n{REWORK_CURRENT_TEXT_HEADER}\n{rework_payload}"
                     modified_state["user_message"] = (

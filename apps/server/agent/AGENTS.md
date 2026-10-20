@@ -34,14 +34,14 @@ agent/
 │   ├── output_truncation.py# 输出截断后的续写提示
 │   ├── author_facing_text.py # 作者可见文字整理（AgentTextShaper、交接原因、角色中文名）
 │   ├── session_loader.py   # 历史窗口 + 面包屑 + 跨轮工作集
-│   ├── message_manager.py  # 系统提示构建、历史保存、作者语言判断
+│   ├── message_manager.py  # 系统提示与本轮上下文构建、历史保存、作者语言判断
 │   ├── stream_processor.py # <file>…</file> 捕获状态机
 │   ├── llm_client.py / deepseek_client.py # OpenAI 兼容客户端
 │   └── metrics.py
 ├── graph/                  # 多 agent 工作流（自研编排，非 LangGraph）
 │   ├── writing_graph.py    # run_writing_workflow_streaming：路由、agent 循环、交接、自动质检
 │   ├── router.py           # 意图路由（RouterDecision、跨轮路由延续）
-│   ├── nodes.py            # run_streaming_agent：拼系统提示并调用 runner
+│   ├── nodes.py            # run_streaming_agent：组装本次运行的系统指令并调用 runner
 │   ├── state.py            # WritingState
 │   ├── author_scope.py     # 按作者本轮要求收窄工作流
 │   ├── body_writes.py      # writer 本轮写进正文类文件的字数
@@ -87,13 +87,15 @@ agent/
    同文件还有 `/stop`（作者停止）、`/steer`（运行中插话）、`/suggest`、`/health`。新增会触发 LLM 的端点必须同时有
    鉴权 + 项目权限 + 成本上限 + 按用户限流（见该文件模块 docstring）。
 2. `AgentService.process_stream`（`service.py`）：`SessionLoader` 取历史与跨轮工作集，`ContextAssembler` 组装上下文，
-   `MessageManager.build_system_prompt` 建系统提示，`ToolContext.set_context` 设置工具上下文，然后
+   `MessageManager.build_system_prompt` 建只含跨轮、跨角色不变内容的系统提示，`build_turn_context` 建本轮上下文
+   （拼进本轮用户消息，见「上下文与跨轮记忆」），`ToolContext.set_context` 设置工具上下文，然后
    `StreamAdapter.process_workflow_events(run_writing_workflow_streaming(...))`，结束时保存历史。
 3. `run_writing_workflow_streaming`（`graph/writing_graph.py`）选初始 agent，顺序是：`resume_route_after_exhaustion`
    （上一轮截停后只回「继续」）→ 笼统要求先问清楚 → `inherit_routing_after_clarification`（仅 llm 策略）→
    `router_node`（llm）或固定从 writer 开始（off）。策略来自 `AGENT_ROUTER_STRATEGY`；前端 `generation_mode=fast`
-   强制 off 并关自动质检，`quality` 强制 llm 并开自动质检。之后循环跑 agent，直到完成或达到协作轮数上限。
-4. `nodes.run_streaming_agent`：基础提示 + 角色提示 + `scope_directive` 等 → `openai_agents/runner.run_openai_agents_streaming_agent`。
+   （前端默认）照常走 llm 路由、只关自动质检，`quality` 强制 llm 并开自动质检。[fast-mode-default][n-fast-default]之后循环跑 agent，直到完成或达到协作轮数上限。
+4. `nodes.run_streaming_agent`：共用系统提示 + `nodes.build_agent_directive`（角色提示 + `scope_directive` 等，作为这次输入的最后一条消息）
+   → `openai_agents/runner.run_openai_agents_streaming_agent`。[cache-stable-prompt-layout][n-cache-layout]
    runner 用 `Runner.run_streamed` 跑 SDK，事件映射：`response.output_text.delta` → TEXT，reasoning delta → THINKING，
    `tool_called` → TOOL_USE，`tool_output` → TOOL_RESULT / HANDOFF / WORKFLOW_STOPPED（熔断后为
    MESSAGE_END(stop_reason=tool_failure_circuit_open) + ERROR）。
@@ -158,10 +160,11 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
   质量门可用且作者要正文时，writer 前的原计划可写角色也按成功正文写入扣留；同一交付的累计正文达到门槛、实际沿计划前缀交接且没有收尾问题才丢弃，
   正文记录接续给 writer。只有规划、失败写入、未执行交接和提问原样释放。[planned-body-review][n-planned-body]
 - **送审证据用落库后的事实**：送审交接附 `[本轮正文字数]`（落库后的 `count_words`）和 `[作者的篇幅要求]`
-  （`review_evidence.find_length_requirements`），读取有时间上限、超时用已读到的；`[待审查内容]` 取本请求写过的正文落库后的样子，
+  （`review_evidence.find_length_requirements`：原话 + `length_requirement_bounds` 换算的达标区间，单个目标数 ±15%，
+  范围和上下限是硬要求；区间内不算缺陷），读取有时间上限、超时用已读到的；`[待审查内容]` 取本请求写过的正文落库后的样子，
   放不进预算的长文件只附本请求改动的那段（写入前正文由 `ToolContext.remember_pre_write_content` 记下）。
-  多文件在既有总预算内逐文件分配，每份保留来源文件 ID 与 `updated_at`；未附全文的部分明确标注，按 ID 精确 `query_files` 读取，不把省略部分当作已经核对。
-  [single-summary][n-summary]、[writer-delivery-requirements][n-length]、[thinking-loop-inputs][n-thinking]
+  多文件在既有总预算内逐文件分配，每份保留来源文件 ID 与 `updated_at`；附了全文的来源行写「以下是全文，不用再读取」，未附全文的部分明确标注，按 ID 精确 `query_files` 按章节读取，不把省略部分当作已经核对。返修交接的 `[返修对象当前正文]` 只附审稿意见点到的文件。
+  [single-summary][n-summary]、[writer-delivery-requirements][n-length]、[thinking-loop-inputs][n-thinking]、[quality-mode-lean][n-lean]
 - **自动质检门只认成功的正文写入**：按 `graph/body_writes.py` 计 draft / script 里实际写进的字数；改大纲、设定、角色和聊天文字不算；
   写入全部失败时不送审。[single-summary][n-summary]、[tool-failure-breaker][n-breaker]、[review-gating][n-review]
 - **作品第一条消息不送审**：`state["first_message_project_label"]` 非空的一轮关掉自动质检门，writer 自己 `handoff_to_agent(quality_reviewer)` 也丢弃；交接前没给作者写话时，同一个 writer 再跑一轮只写总结（`FIRST_ROUND_SUMMARY_CONTEXT`，一次）。作者读到的是 writer 自己的交付说明，不是返修记录；路由显式安排的审稿照常。[first-turn-skips-review][n-first-review]
@@ -175,9 +178,11 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
   `update_project` 照常；只读请求留下的空文件直接回滚、不补写。[scope][n-scope]
 - **调了不存在的工具不致命**：runner 的 `RunConfig` 设 `tool_not_found_behavior="return_error_to_model"`，返回
   `error_type="tool_not_found"` 并经熔断器记账（同名连续 3 次的熔断原因为 `repeated_unavailable_tool_call`）。[scope][n-scope]、[tool-failure-breaker][n-breaker]
-- **范围指令进每个 agent 的系统提示**：路由的范围判断转成 `state["scope_directive"]`，由 `nodes.run_streaming_agent` 追加到系统提示
-  末尾，每次跑 agent 前按当前 agent 重新生成（「规划完直接交接 writer」只给规划类角色）；计划交接的 `handoff_packet.todo` 带用户
-  `scope`。[scope][n-scope]
+- **范围指令进每个 agent 运行的系统指令**：路由的范围判断转成 `state["scope_directive"]`，由 `nodes.build_agent_directive` 以
+  `## 本轮用户范围约束 [最高优先级]` 放进这次运行的系统指令（`[本次运行的系统指令]`，runner 把它作为输入最后一条 user 消息，不写回
+  `state["messages"]`；系统提示里固定写明它与系统提示同等效力），每次跑 agent 前按当前 agent 重新生成（「规划完直接交接 writer」只给规划类角色）；
+  计划交接的 `handoff_packet.todo` 带用户 `scope`。角色提示、截断续写、篇幅要求、快速模式同样放在这里，不进系统提示。
+  [scope][n-scope]、[cache-stable-prompt-layout][n-cache-layout]
 - **空文件纠偏轮由建空文件的 agent 自己补写**；被纠偏打断的一轮若以提问收尾，「等用户回答」带过纠偏轮。[scope][n-scope]
 - **写完 `</file>` 就结束 run 时同一 agent 续写**：有写权限的 agent 这次 run 里 create_file 成功、最后的文字以写完的 `<file>` 正文
   结束（`completion_evidence.ends_on_file_block`），且没有显式交接、澄清、轮数耗尽、错误时，同一 agent 再跑一轮（交接说明以
@@ -191,7 +196,7 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
   （`content=""` + `next_step`）；挡路的是别的文件时照旧 `pending_empty_file_unwritten`（`mcp_tools._repeat_of_pending_empty_file`）。
   [repeat-create][n-repeat]
 - **项目备注由作者维护确认来源**：Agent 的新/改写条目仅为 AI 提议，引文、编号或答应文字不能升格；旧的作者确认和未标来源条目即使漏传或 notes="" 也保留。proposals 只替换提议区，三块共用4000字；作者直接保存 AI 记忆文本框仍可编辑整个字段。作者自己的项目名也不能由模型布尔值或原话放行改名。参见 [typed-boundaries][n-typed-boundaries]。
-- **回复语言跟随作者最近一条消息**（`message_manager.detect_author_language`），系统提示末尾写明本轮语言，所有角色共用；界面语言只在
+- **回复语言跟随作者最近一条消息**（`message_manager.detect_author_language`），本轮上下文 `<turn_context>` 末尾写明本轮语言，所有角色共用；界面语言只在
   看不出时兜底。[reply-language][n-lang]
 
 ## 流的终止、停止与计费
@@ -225,7 +230,11 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
   编辑 / 删除和按 id 精确读取的文件）和工作集（最近 2 条 assistant 回复读写过的文件，按当前库内容整份注入，最多
   `AGENT_WORKING_SET_MAX_FILES`=8 份、`AGENT_WORKING_SET_MAX_CHARS`=60000 字）。`service.py` 用
   `SessionLoader.attach_working_set_to_user_content` 把它拼在本轮用户消息之前，不进系统提示、不改历史，前缀缓存可以一直命中。
-- 决策记录：[full-text-and-working-set][n-context]、[characters-and-core-lore][n-lore]。
+- 本轮上下文（`MessageManager.build_turn_context`，`<turn_context>`）：叙事约束、作者本条消息选的技能、组装的项目上下文、当前文件、
+  任务计划板快照、本轮回复语言。放在本轮用户消息最前面、工作集之前；系统提示只留基础提示、语言规则、布局说明和技能目录，
+  所以 `[系统提示][历史]` 跨轮、跨 agent 逐字不变（`tests/test_agent/test_prompt_cache_prefix.py`）。历史超过预算后窗口每轮滑动，
+  仍会在系统提示之后打断跨轮前缀。
+- 决策记录：[full-text-and-working-set][n-context]、[characters-and-core-lore][n-lore]、[cache-stable-prompt-layout][n-cache-layout]。
 
 ## 工具
 
@@ -326,3 +335,6 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
 [n-range]: ../../../.agents/notes/implemented/feature/2026-10-19-query-files-range-reads.md
 [n-first-turn]: ../../../.agents/notes/implemented/feature/2026-10-19-first-turn-writes-before-asking.md
 [n-first-review]: ../../../.agents/notes/implemented/feature/2026-10-20-first-turn-skips-auto-review.md
+[n-fast-default]: ../../../.agents/notes/implemented/feature/2026-10-20-fast-mode-default-keeps-router.md
+[n-cache-layout]: ../../../.agents/notes/implemented/bug-fix/2026-10-20-agent-cache-stable-prompt-layout.md
+[n-lean]: ../../../.agents/notes/implemented/simplification/2026-10-20-quality-mode-length-tolerance-and-attached-text.md
