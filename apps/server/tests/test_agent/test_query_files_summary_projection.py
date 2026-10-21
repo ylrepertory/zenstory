@@ -396,6 +396,10 @@ def test_paging_type_keyword_and_zero_controls(store):
     ]
     for args, expected in cases:
         payload, _ = store.call(args)
+        if "query" in args:
+            # 关键词查询另外附上正文命中处的原文（见 test_mcp_tools 的命中片段用例）。
+            for row in payload["data"]:
+                assert row.pop("match_count") >= 1 and args["query"] in row.pop("matches")[0]
         assert payload == store.expected(expected)
     # Exact-ID applies both type constraints (different from merged page precedence).
     payload, _ = store.call({"id": store.rows[0]["id"], "file_type": "lore"})
@@ -456,9 +460,16 @@ def test_actual_product_import_provenance():
     _record("import-provenance", records)
 
 
-def _assert_projection_budget(observation):
-    """Prospective authorized budget, distinct from original functional correctness."""
-    assert len(observation["sql"]) == 2  # real permission + one File SELECT, no lazy N+1
+def _assert_projection_budget(observation, *, keyword_matches=False):
+    """Prospective authorized budget, distinct from original functional correctness.
+
+    A keyword query also reads the matched files' bodies once (id + content only) to return
+    the matching passages; the listing SELECT itself still carries no content.
+    """
+    expected = 3 if keyword_matches else 2  # real permission + one File SELECT (+ matches), no lazy N+1
+    assert len(observation["sql"]) == expected
+    if keyword_matches:
+        assert sorted(observation["sql"][-1]["projection_keys"]) == ["content", "id"]
     file_queries = [
         query
         for query in observation["sql"]
@@ -569,5 +580,7 @@ def test_postgres_native_unicode_preview_parity(store):
     assert payload == store.expected(store.rows)
     _assert_projection_budget(observation)
     payload, observation = store.call({"query": "file-900:", "limit": 32})
+    for matched in payload["data"]:
+        assert matched.pop("match_count") >= 1 and "file-900:" in matched.pop("matches")[0]
     assert payload == store.expected([row])
-    _assert_projection_budget(observation)
+    _assert_projection_budget(observation, keyword_matches=True)
