@@ -465,8 +465,14 @@ async def _run_against_local_model(
     state_extra: dict | None = None,
     tool_impls: dict | None = None,
     agent_type: str = "writer",
+    followups: list[dict] | None = None,
+    run_starts: list[int] | None = None,
 ):
-    """script(request_index) -> 该次模型调用要返回的 chunk 列表。"""
+    """script(request_index) -> 该次模型调用要返回的 chunk 列表。
+
+    followups：同一个 state 上接着跑的 run，每项 {"agent_type": ..., "state": {...}}；
+    run_starts：传入时记下每个 run 第一次请求的下标。
+    """
     from agent.openai_agents.model import reset_sdk_model_cache
     from agent.openai_agents.runner import run_openai_agents_streaming_agent
 
@@ -519,14 +525,19 @@ async def _run_against_local_model(
     impls = {"edit_file": edit_impl, **(tool_impls or {})}
     try:
         with patch.dict("agent.openai_agents.tools_adapter.TOOL_FUNCTIONS", impls):
-            events = [
-                event
-                async for event in run_openai_agents_streaming_agent(
-                    state=state,
-                    agent_type=agent_type,
-                    system_prompt="你是测试助手",
-                )
-            ]
+            events = []
+            for run in [{"agent_type": agent_type, "state": {}}, *(followups or [])]:
+                state.update(run.get("state") or {})
+                if run_starts is not None:
+                    run_starts.append(len(requests))
+                events.extend([
+                    event
+                    async for event in run_openai_agents_streaming_agent(
+                        state=state,
+                        agent_type=run["agent_type"],
+                        system_prompt="你是测试助手",
+                    )
+                ])
     finally:
         server.shutdown()
         server.server_close()
@@ -644,26 +655,6 @@ async def test_sdk_run_recovers_when_retry_succeeds(monkeypatch):
     assert "".join(e.data.get("text", "") for e in events if e.type == StreamEventType.TEXT) == "已改好"
 
 
-@pytest.mark.unit
-def test_read_only_tool_set_keeps_write_tools_but_marks_them_unavailable():
-    """只读请求：写文件工具仍在工具集里（模型调用时拿到可恢复错误而非 SDK 致命错误），
-    描述里标明本轮不可用；其余工具不受影响。"""
-    from agent.openai_agents.tools_adapter import (
-        READ_ONLY_TOOL_DESCRIPTION_PREFIX,
-        build_agent_function_tools,
-    )
-    from agent.tools.registry import FILE_WRITE_TOOL_NAMES
-
-    full = {tool.name: tool for tool in build_agent_function_tools("writer")}
-    read_only = {tool.name: tool for tool in build_agent_function_tools("writer", read_only=True)}
-
-    assert FILE_WRITE_TOOL_NAMES <= set(full)
-    assert set(read_only) == set(full)
-    for name, tool in read_only.items():
-        marked = tool.description.startswith(READ_ONLY_TOOL_DESCRIPTION_PREFIX)
-        assert marked is (name in FILE_WRITE_TOOL_NAMES), name
-
-
 @pytest.mark.asyncio
 @pytest.mark.unit
 async def test_read_only_write_tools_refuse_without_executing():
@@ -769,9 +760,9 @@ async def test_sdk_read_only_request_write_attempt_recovers_with_answer(monkeypa
 @pytest.mark.asyncio
 @pytest.mark.unit
 @pytest.mark.usefixtures("_reset_metrics_and_model_cache")
-async def test_sdk_unknown_tool_is_returned_to_model_not_fatal(monkeypatch):
-    """模型调用工具集里没有的工具（审稿人照着共享历史调 edit_file）：SDK 不再抛
-    ModelBehaviorError，错误交还模型，run 以回答正常结束。"""
+async def test_reviewer_write_call_is_returned_to_model_not_fatal(monkeypatch):
+    """审稿人照着共享历史调 edit_file：工具清单人人相同，调用按角色拒绝，
+    错误交还模型，run 以回答正常结束（不存在的工具见下一个测试）。"""
     from agent.core.workflow_events import StreamEventType
 
     def script(index: int) -> list[dict]:
@@ -784,8 +775,8 @@ async def test_sdk_unknown_tool_is_returned_to_model_not_fatal(monkeypatch):
     )
 
     assert len(requests) == 2
-    not_found = json.loads(_tool_messages(requests[1])[-1])
-    assert not_found["error_type"] == "tool_not_found"
+    refused = json.loads(_tool_messages(requests[1])[-1])
+    assert refused["error_type"] == "tool_not_permitted_for_role"
     types = [event.type for event in events]
     assert StreamEventType.ERROR not in types
     assert events[-1].data["stop_reason"] == "end_turn"
@@ -860,3 +851,118 @@ def test_repeated_read_only_refusal_trips_as_unavailable_call():
     assert trip is not None
     assert trip.reason == TRIP_REASON_TOOL_NOT_FOUND
     assert "相同参数" not in trip.user_message()
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+@pytest.mark.usefixtures("_reset_metrics_and_model_cache")
+async def test_agent_run_exports_no_traces_even_in_a_fresh_process(monkeypatch):
+    """The SDK must never send traces (authors' drafts and messages) to OpenAI's trace backend.
+
+    The model client is built at the first model call, after the SDK opened the run's
+    trace; production logged trace exports (401) on the first run of each new process.
+    """
+    from agents import add_trace_processor, set_tracing_disabled
+    from agents.tracing import TracingProcessor
+
+    class _Recorder(TracingProcessor):
+        def __init__(self):
+            self.events: list[str] = []
+
+        def on_trace_start(self, trace):
+            self.events.append("trace")
+
+        def on_trace_end(self, trace):
+            pass
+
+        def on_span_start(self, span):
+            self.events.append("span")
+
+        def on_span_end(self, span):
+            pass
+
+        def shutdown(self):
+            pass
+
+        def force_flush(self):
+            pass
+
+    recorder = _Recorder()
+    add_trace_processor(recorder)
+    set_tracing_disabled(False)  # a fresh server process: nothing has disabled tracing yet
+
+    def script(index: int) -> list[dict]:
+        return _text_chunks("好的。")
+
+    await _run_against_local_model(monkeypatch, script, None)
+
+    assert recorder.events == []
+
+
+
+def _tool_call_then(index: int, call_id: str, name: str, args: str, final: str) -> list[dict]:
+    return _tool_call_chunks(call_id, name, args) if index == 0 else _text_chunks(final)
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+@pytest.mark.usefixtures("_reset_metrics_and_model_cache")
+async def test_same_agent_next_run_continues_the_previous_run_append_only(monkeypatch):
+    """A continuation run (same agent right after itself) starts from the previous run's full
+    input: the request only grows at the end (prompt-cache hit) and files read stay readable."""
+    read_result = json.dumps({"status": "success", "data": {"id": "f1", "content": "第一章原文。"}}, ensure_ascii=False)
+
+    async def fake_query(_args):
+        return {"content": [{"type": "text", "text": read_result}]}
+
+    def script(index: int) -> list[dict]:
+        if index == 0:
+            return _tool_call_chunks("call-0", "query_files", '{"id": "f1"}')
+        return _text_chunks("<file>\n第二章。\n</file>" if index == 1 else "第二章写好了。")
+
+    run_starts: list[int] = []
+    _events, requests, _state = await _run_against_local_model(
+        monkeypatch, script, None,
+        state_extra={"native_run_holder": {}, "context_snapshot": "<project_snapshot>资料</project_snapshot>"},
+        tool_impls={"query_files": fake_query},
+        followups=[{"agent_type": "writer", "state": {
+            "continue_native_run": True, "user_message": "[来自上一个Agent的交接信息]: 继续写总结",
+        }}],
+        run_starts=run_starts,
+    )
+
+    first_run_last, second_run_first = requests[run_starts[1] - 1], requests[run_starts[1]]
+    previous = first_run_last["messages"]
+    assert second_run_first["messages"][: len(previous)] == previous
+    assert any("第一章原文" in str(m.get("content")) for m in second_run_first["messages"] if m.get("role") == "tool")
+    contents = [str(m.get("content")) for m in second_run_first["messages"]]
+    assert sum("<project_snapshot>" in c for c in contents) == 1
+    assert contents[-1] == "[来自上一个Agent的交接信息]: 继续写总结"
+
+
+@pytest.mark.asyncio
+@pytest.mark.unit
+@pytest.mark.usefixtures("_reset_metrics_and_model_cache")
+async def test_a_different_agent_does_not_continue_the_previous_run(monkeypatch):
+    async def fake_query(_args):
+        return {"content": [{"type": "text", "text": json.dumps({"status": "success", "data": {"id": "f1"}})}]}
+
+    def script(index: int) -> list[dict]:
+        if index == 0:
+            return _tool_call_chunks("call-0", "query_files", '{"id": "f1"}')
+        return _text_chunks("好的。")
+
+    run_starts: list[int] = []
+    _events, requests, _state = await _run_against_local_model(
+        monkeypatch, script, None,
+        state_extra={"native_run_holder": {}},
+        tool_impls={"query_files": fake_query},
+        followups=[{"agent_type": "quality_reviewer", "state": {"continue_native_run": True}}],
+        run_starts=run_starts,
+    )
+
+    writer_last = requests[run_starts[1] - 1]["messages"]
+    reviewer_first = requests[run_starts[1]]["messages"]
+    assert any(m.get("role") == "tool" for m in writer_last)
+    # Rebuilt from the folded history (tool results are not replayed across agents).
+    assert not any(m.get("role") == "tool" for m in reviewer_first)

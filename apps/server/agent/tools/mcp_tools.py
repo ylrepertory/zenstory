@@ -217,7 +217,7 @@ class _PendingEmptyFileState:
     has_pending / latest / snapshot 的语义不变（writing_graph 的边界核验照旧兜底）。
     """
 
-    __slots__ = ("_lock", "_entries", "_reservations", "_reject_count", "_streamed")
+    __slots__ = ("_lock", "_entries", "_reservations", "_reject_count", "_streamed", "_reply_seq", "_created_in")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -228,6 +228,10 @@ class _PendingEmptyFileState:
         self._reject_count = 0
         # 正文已以闭合 <file> 块出现在模型回复里、只差 adapter 落库的条目
         self._streamed: set[str] = set()
+        # 第几次模型回复（每次模型调用开始时 +1），以及每个待写文件是在第几次回复里建的：
+        # 上一次回复建的文件，这一次回复必须先写它的正文（见 overdue_unwritten）。
+        self._reply_seq = 0
+        self._created_in: dict[str, int] = {}
 
     # ---- 只读视图 ----------------------------------------------------------
     def has_pending(self) -> bool:
@@ -251,8 +255,22 @@ class _PendingEmptyFileState:
             ]
 
     # ---- 写入 --------------------------------------------------------------
+    def begin_reply(self) -> None:
+        """一次新的模型调用开始。"""
+        with self._lock:
+            self._reply_seq += 1
+
+    def overdue_unwritten(self) -> str | None:
+        """上一次（或更早的）回复建好、这次回复还没写出正文的文件标题；没有时 None。"""
+        with self._lock:
+            for file_id, title in self._entries.items():
+                if file_id not in self._streamed and self._created_in.get(file_id, self._reply_seq) < self._reply_seq:
+                    return title
+            return None
+
     def add(self, file_id: str, title: str) -> None:
         with self._lock:
+            self._created_in[file_id] = self._reply_seq
             self._entries[file_id] = title
             # 同一文件重新进入待写：旧的"正文已写出"标记不能沿用
             self._streamed.discard(file_id)
@@ -343,6 +361,7 @@ class _PendingEmptyFileState:
             self._reservations.pop(ticket, None)
             if file_id:
                 self._entries[file_id] = title
+                self._created_in[file_id] = self._reply_seq
                 # 幂等复用命中同一文件时它重新等待正文，旧标记作废
                 self._streamed.discard(file_id)
                 self._reject_count = 0
@@ -931,6 +950,19 @@ class ToolContext:
         if state is not None:
             return state.latest()
         return _pending_empty_file_var.get()
+
+    @classmethod
+    def begin_model_reply(cls) -> None:
+        """一次新的模型调用开始（usage_hooks 的 on_llm_start）。"""
+        state = cls._get_pending_empty_file_state()
+        if state is not None:
+            state.begin_reply()
+
+    @classmethod
+    def overdue_file_body(cls) -> str | None:
+        """上一次回复建好、这次回复还没写正文的文件标题（两次回复协议被跳过）。"""
+        state = cls._get_pending_empty_file_state()
+        return state.overdue_unwritten() if state is not None else None
 
     @classmethod
     def mark_latest_pending_body_streamed(cls) -> None:
@@ -1848,6 +1880,21 @@ def _pending_empty_file_rejection(blocking_title: str | None, title: str) -> dic
     return _make_mcp_payload(payload, tool_name="create_file")
 
 
+def _awaiting_body_data(data: dict[str, Any], title: str) -> dict[str, Any]:
+    """create_file 建好了空文件：告诉模型下一次回复就写正文。
+
+    下一次回复没写正文就调用的工具会被拒绝（``tools_adapter.file_body_pending_text``）。
+    """
+    return {
+        **data,
+        "awaiting_body": True,
+        "next_step": (
+            f"「{title}」已建好，正文还是空的。下一次回复直接以 <file> 开头写它的正文，"
+            "写完用 </file> 结束；不要先调用其他工具。"
+        ),
+    }
+
+
 def _repeat_of_pending_empty_file(args: dict[str, Any], project_id: str) -> dict[str, Any] | None:
     """create_file 被挡住时，判断它是不是在重复创建正挡路的那个空文件；是就把那个文件交回去。
 
@@ -1914,10 +1961,8 @@ def _repeat_of_pending_empty_file(args: dict[str, Any], project_id: str) -> dict
     )
     data = serialize_file(row)
     data["content"] = ""
-    data["next_step"] = (
-        f"「{title}」已经建好，正文还是空的。不要再调用 create_file，"
-        "接下来直接以 <file> 开头写它的正文，写完用 </file> 结束。"
-    )
+    data = _awaiting_body_data(data, title)
+    data["next_step"] = "不要再调用 create_file。" + data["next_step"]
     return _make_result(
         {"status": "success", "mutation_applied": False, "data": data},
         tool_name="create_file",
@@ -1998,10 +2043,12 @@ def _create_file_sync(args: dict[str, Any]) -> dict[str, Any]:
         # folder 例外：文件夹是纯容器节点，永远不会收到 <file>…</file> 正文，
         # 给它置标记后无人清除（标记跨子任务可见），会硬阻断本轮后续所有建档，
         # 并让 writing_graph 的纠偏分支把章节正文追加到文件夹节点上。
+        awaiting_body = False
         if reservation is not None:
             file_id = result.get("id", "")
             if file_id and not _is_folder_file_type(result, args):
                 ToolContext.bind_pending_empty_file(reservation, file_id, title)
+                awaiting_body = True
             else:
                 ToolContext.release_pending_empty_file(reservation)
             reservation = None
@@ -2013,11 +2060,14 @@ def _create_file_sync(args: dict[str, Any]) -> dict[str, Any]:
             payload={"title": result.get("title"), "file_type": result.get("file_type")},
         )
 
+        data = _elide_reused_file_content(result)
+        if awaiting_body:
+            data = _awaiting_body_data(data, title)
         return _make_result(
             {
                 "status": "success",
                 "mutation_applied": result.get("mutation_applied") is True,
-                "data": _elide_reused_file_content(result),
+                "data": data,
             },
             tool_name=tool_name,
         )
@@ -3156,4 +3206,3 @@ MCP_TOOL_HANDLERS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "read_skill_resource": read_skill_resource,
 }
 
-ALL_MCP_TOOLS = list(MCP_TOOL_HANDLERS.values())

@@ -2,8 +2,7 @@
 
 ZenStory 写作 agent 的服务端：路由 → 多角色工作流（planner / hook_designer / writer / quality_reviewer）→
 openai-agents-python 运行时（OpenAI 兼容 Chat Completions，主备两个供应商，见 `core/llm_providers.py` / `core/llm_failover.py`）→ SSE。
-工作流是 `graph/` 里的自研编排，**不使用 LangGraph**；`StreamAdapter.process_langgraph_events` 只是
-`process_workflow_events` 的兼容别名。
+工作流是 `graph/` 里的自研编排，**不使用 LangGraph**。
 
 路径约定：不带前缀的路径相对 `apps/server/agent/`；模块外的文件写全路径（例如 `apps/server/utils/logger.py`，
 不要和 `agent/utils/` 混淆）。行为细节与取舍以 `.agents/notes/` 里链接的决策记录为准，改行为前先读对应记录。
@@ -78,8 +77,7 @@ agent/
 │   ├── author_edit_guard.py# 作者手改文件的删除 / 整份覆盖保护
 │   ├── task_progress.py    # 任务板编号范围与实际文件对照
 │   └── permissions.py
-├── utils/                  # aho_corasick、token_utils、world_model_visibility
-└── llm/                    # 空的遗留占位包，不要往里加代码
+└── utils/                  # aho_corasick、token_utils、world_model_visibility
 ```
 
 ## 请求与流
@@ -107,8 +105,9 @@ agent/
 预算（`apps/server/config/agent_runtime.py`，均可用同名环境变量覆盖）：`AGENT_COLLABORATION_MAX_ITERATIONS`（12，agent 轮数）、
 `AGENT_TOOL_CALL_MAX_ITERATIONS`（60，单次 run 的 SDK max_turns，最后 `runner.SOFT_LANDING_TURNS` 轮提示收尾）、
 `AGENT_RUN_MAX_MODEL_CALLS`（120，请求级）、`AGENT_RUN_WALL_CLOCK_TIMEOUT_S`（780，须早于 Railway 900 秒断连）、
+`AGENT_RUN_WRAP_UP_AFTER_S`（默认时限减 180 秒：之后每次模型调用都提醒收尾、图不再开新的 agent run）、
 `AGENT_SSE_HEARTBEAT_INTERVAL_S`（15）、`AGENT_AUTO_REVIEW_THRESHOLD_CHARS`（500）。见 [runtime-budget-and-heartbeat][n-budget]、
-[no-progress-guard-and-soft-cap][n-noprogress]、[platform-deadline-and-terminal-guard][n-deadline]。
+[no-progress-guard-and-soft-cap][n-noprogress]、[platform-deadline-and-terminal-guard][n-deadline]、[wall-clock-wrap-up][n-wrap-up]。
 
 ## 多 Agent 协作
 
@@ -149,7 +148,7 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
 - **规划补写只认结构化请求类型**：Router 明确给出 `requested_file_types` 且包含 outline 时，规划师在聊天里交付多章规划、未写入大纲文件才有一次纠偏；缺少/非法类型或未请求大纲不从作者措辞补写。参见 [typed-boundaries][n-typed-boundaries]。
 - **作者改了什么给模型看，不猜授权**：`tools/author_changes.py` 按版本历史算净差异放进 `<author_edits>`（`query_files` 按 id 读全文时也带）；
   `edit_file` 在锁内比对本请求模型看过的正文（`mcp_tools._ReadSnapshots`，读到的内容由 `usage_hooks.ReadSnapshotPromotionMixin`
-  在下一次模型调用起生效），作者在生成期间又改了就以 `stale_content` 拒绝，改到作者写的段落时结果带 `author_edits_touched`。
+  在下一次模型调用起生效；换 agent 时清空，同一 agent 接着跑时保留），作者在生成期间又改了就以 `stale_content` 拒绝，改到作者写的段落时结果带 `author_edits_touched`。
   [author-edits-shown-not-guessed][n-author-edits]
 - **受保护稿件不由聊天删除或整份覆盖**：作者保存过正文的文件，在应用内对话中的 delete_file（含递归删除）和 create_file 同名剧集复用会拒绝；附加、焦点、点名、否定词、上一轮提议不授予权限，核验失败也不放行。作者使用现有文件菜单/编辑器；普通 edit_file、AI 自己的产物和直接人工 API 保持既有路径。参见 [typed-boundaries][n-typed-boundaries]。
 - **作者可见文字**：每个 agent run 的 TEXT 经 `core/author_facing_text.AgentTextShaper` 补段落空行；作者写中文时，紧接工具调用的
@@ -189,8 +188,10 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
 - **写完 `</file>` 就结束 run 时同一 agent 续写**：有写权限的 agent 这次 run 里 create_file 成功、最后的文字以写完的 `<file>` 正文
   结束（`completion_evidence.ends_on_file_block`），且没有显式交接、澄清、轮数耗尽、错误时，同一 agent 再跑一轮（交接说明以
   `FILE_STREAM_CONTINUATION_MARKER` 开头）；放在计划交接 / 自动质检之前，正文与正文写入记录接续给续写轮；受 `max_iterations` 约束，
-  每轮都要真的新建并写完文件才再续。
-  [file-stream-continuation][n-continue]
+  每轮都要真的新建并写完文件才再续。同一 agent 紧接着自己再跑（续写、纠偏、只写总结、插话追加、截断续写）时，runner 从上一轮完整的
+  SDK 输入接着来（`runner._continued_run_input`，`state["native_run_holder"]`），请求只在末尾追加、读过的文件不用重读；换了 agent 照旧从折叠后的历史重建。
+  writer 的运行指令要求写多个文件时 `</file>` 之后直接 create_file 下一个（`nodes.WRITER_CHAIN_FILES_DIRECTIVE`）。
+  [file-stream-continuation][n-continue]、[same-agent-continuation][n-continued-run]
 - **「已保存 / 已还原 / 已修改」不做文字检测**：靠 `prompts/base.py` 的 `UNIFIED_EXECUTION_PROTOCOL` 约束（只有本轮对应工具成功后才这样说，
   没改就直说没改）。[file-stream-continuation][n-continue]
 - **任务板声明产物类型和来源**：文件任务声明 artifact_file_type、artifact_refs/file_id 或 unit_spec；收尾只用本请求写过、仍存在非空且类型匹配的项目文件。正文范围每个编号须有实际正文产物，大纲标题不能证明正文；新 done 声明缺证据时不保存任务板。缺类型的旧任务可读但不自动收尾。参见 [typed-boundaries][n-typed-boundaries]。
@@ -230,17 +231,27 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
   world_model 里只列标题 + id。
 - 跨轮（`core/session_loader.py`）：runner 回放历史时丢弃工具结果，新一轮靠面包屑（assistant 历史末尾的「[此前的工具操作]」，列创建 /
   编辑 / 删除和按 id 精确读取的文件）和工作集（最近 2 条 assistant 回复读写过的文件，按当前库内容整份注入，最多
-  `AGENT_WORKING_SET_MAX_FILES`=8 份、`AGENT_WORKING_SET_MAX_CHARS`=60000 字）。`service.py` 用
-  `SessionLoader.attach_working_set_to_user_content` 把它拼在本轮用户消息之前，不进系统提示、不改历史，前缀缓存可以一直命中。
-- 本轮上下文（`MessageManager.build_turn_context`，`<turn_context>`）：叙事约束、作者本条消息选的技能、组装的项目上下文、当前文件、
-  任务计划板快照、本轮回复语言。放在本轮用户消息最前面、工作集之前；系统提示只留基础提示、语言规则、布局说明和技能目录，
-  所以 `[系统提示][历史]` 跨轮、跨 agent 逐字不变（`tests/test_agent/test_prompt_cache_prefix.py`）。历史超过预算后窗口每轮滑动，
-  仍会在系统提示之后打断跨轮前缀。
-- 决策记录：[full-text-and-working-set][n-context]、[characters-and-core-lore][n-lore]、[cache-stable-prompt-layout][n-cache-layout]。
+  `AGENT_WORKING_SET_MAX_FILES`=8 份、`AGENT_WORKING_SET_MAX_CHARS`=60000 字）。
+- 项目资料快照（`context/turn_snapshot.py`）：组装的项目上下文与工作集按条目给出带键的块；会话第一轮（及重建时）渲染成
+  `<project_snapshot>`，作为模型输入第一条消息紧跟系统提示（`runner.build_run_input`，不写回 `state["messages"]`）；之后每轮只把
+  新出现或改过的块放进 `<turn_context>` 的「本轮更新的项目资料」，工作集只发清单。改动超过快照一半、20 轮、2 小时或项目 / 语言变化时重建。
+- 本轮上下文（`MessageManager.build_turn_context`，`<turn_context>`）：叙事约束、作者本条消息选的技能、本轮更新的项目资料、当前文件、
+  任务计划板快照、本轮回复语言，加工作集清单，放在本轮用户消息最前面（`SessionLoader.attach_working_set_to_user_content`）。
+  请求布局 `[系统提示][项目资料快照][历史][本轮上下文 + 作者消息][本次运行指令]`，前四段跨轮、跨 agent 逐字不变
+  （`tests/test_agent/test_prompt_cache_prefix.py`）。历史超出预算时窗口起点对齐锚点（`session_loader.anchor_history_window`），
+  停几轮再整段跳，不每轮滑动。
+- 决策记录：[full-text-and-working-set][n-context]、[characters-and-core-lore][n-lore]、[cache-stable-prompt-layout][n-cache-layout]、
+  [context-snapshot-and-cache-stable-tools][n-snapshot]。
 
 ## 工具
 
-工具清单以 `tools/registry.py` 为准：`DEFAULT_TOOL_NAMES`（planner / hook_designer / writer）、`QUALITY_REVIEWER_TOOL_NAMES`（审稿人，没有写工具）。
+工具清单以 `tools/registry.py` 为准：每个角色、每一轮在请求里看到的都是同一份 `EXPOSED_TOOL_NAMES`（前缀缓存不按角色分裂）；
+角色能执行哪些工具由 `AGENT_TOOL_NAME_MAP` 决定（`DEFAULT_TOOL_NAMES` 给 planner / hook_designer / writer，`QUALITY_REVIEWER_TOOL_NAMES`
+给审稿人，没有写工具），越权调用在 `tools_adapter` 里以 `tool_not_permitted_for_role` 拒绝，本轮不可用的工具写进运行指令的
+`## 本轮工具限制`。create_file 建好空文件后返回 `awaiting_body` 与 `next_step`；下一次回复没先以 <file> 写完正文就调用的工具
+（delete_file / request_clarification 除外）以 `file_body_pending` 拒绝（`tools_adapter`，按 on_llm_start 记的回复序号判断），
+先写完正文再 create_file 下一个文件的连写照常。SDK tracing 每次 run 都关掉（`RunConfig(tracing_disabled=True)`），不向 OpenAI 导出内容。
+[fast-mode-summary-and-file-body-turn][n-body-turn]
 
 | 工具 | 用途 |
 |---|---|
@@ -339,4 +350,8 @@ quality_reviewer；同一交付在 writer 及其之前的计划内可写角色�
 [n-first-review]: ../../../.agents/notes/implemented/feature/2026-10-20-first-turn-skips-auto-review.md
 [n-fast-default]: ../../../.agents/notes/implemented/feature/2026-10-20-fast-mode-default-keeps-router.md
 [n-cache-layout]: ../../../.agents/notes/implemented/bug-fix/2026-10-20-agent-cache-stable-prompt-layout.md
+[n-snapshot]: ../../../.agents/notes/implemented/architecture/2026-10-21-context-snapshot-and-cache-stable-tools.md
+[n-body-turn]: ../../../.agents/notes/implemented/bug-fix/2026-10-21-fast-mode-summary-and-file-body-turn.md
+[n-wrap-up]: ../../../.agents/notes/implemented/bug-fix/2026-10-21-wall-clock-wrap-up.md
+[n-continued-run]: ../../../.agents/notes/implemented/architecture/2026-10-21-same-agent-runs-continue-the-previous-input.md
 [n-lean]: ../../../.agents/notes/implemented/simplification/2026-10-20-quality-mode-length-tolerance-and-attached-text.md

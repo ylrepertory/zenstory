@@ -6,6 +6,7 @@ reducing complexity in the main service module.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import desc, or_
+from sqlalchemy import desc, func, or_
 from sqlmodel import Session, and_, select
 
 from agent.utils.token_utils import estimate_message_tokens
@@ -61,6 +62,36 @@ _BREADCRUMB_VERBS_EN = {
 _FAILED_TOOL_STATUSES = {"error", "failed", "failure"}
 
 _HISTORY_INITIAL_PAGE_SIZE = 20
+
+# 历史窗口的起点只落在「锚点」user 消息上：预算吃紧时窗口不再每轮往后滑一条、把
+# [系统提示] 之后的前缀全部打断，而是在同一个锚点上停几轮，再整段跳到下一个锚点。
+# 锚点由消息在会话里的序号决定（每 HISTORY_WINDOW_ANCHOR_SPAN 条消息开头的 user 消息），
+# 与这一轮的预算、窗口终点无关；没有序号时按消息 id 哈希兜底。
+HISTORY_WINDOW_ANCHOR_SPAN = 8
+
+
+def _is_history_anchor(message: dict[str, Any]) -> bool:
+    if message.get("role") != "user":
+        return False
+    ordinal = message.get("ordinal")
+    if isinstance(ordinal, int):
+        return ordinal % HISTORY_WINDOW_ANCHOR_SPAN < 2
+    if not message.get("id"):
+        return False
+    digest = hashlib.sha1(str(message["id"]).encode("utf-8")).digest()
+    return digest[0] % (HISTORY_WINDOW_ANCHOR_SPAN // 2) == 0
+
+
+def anchor_history_window(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Start a token-trimmed history window at an anchor message (prompt-cache stability).
+
+    Only anchors in the older half of the window are used, so at most half the window
+    is given up; without one the window is returned unchanged.
+    """
+    for index in range(len(messages) // 2 + 1):
+        if _is_history_anchor(messages[index]):
+            return messages[index:]
+    return messages
 _HISTORY_MAX_PAGE_SIZE = 200
 _HISTORY_PAGE_TEXT_BYTES = 4 * 1024 * 1024
 
@@ -77,6 +108,10 @@ class SessionData:
     working_set_refs: list[dict[str, Any]] = field(default_factory=list)
     # 按当前库内容渲染的跨轮工作集纯文本块；没有可注入内容时为空串
     working_set_context: str = ""
+    # The same working set split for the context snapshot (agent/context/turn_snapshot.py):
+    # full-text files as keyed blocks, and the rest of the section sent every turn.
+    working_set_blocks: list[dict[str, str]] = field(default_factory=list)
+    working_set_tail: str = ""
     # 作者在 AI 写过之后亲手改了什么（<author_edits> 块，agent/tools/author_changes.py）；没有时为空串
     author_edits_context: str = ""
     author_edited_file_ids: set[str] = field(default_factory=set)
@@ -475,13 +510,17 @@ class SessionLoader:
             result.working_set_context = ""
             return
         try:
+            parts: dict[str, Any] = {}
             result.working_set_context = self._build_working_set_context(
                 session=session,
                 refs=refs,
                 full_in_context_ids=self._full_text_context_ids(result.context_data),
                 author_edited_file_ids=result.author_edited_file_ids,
                 rendered_full_contents=result.read_snapshots,
+                parts_out=parts,
             )
+            result.working_set_blocks = parts.get("blocks", [])
+            result.working_set_tail = parts.get("tail", "")
         except Exception as exc:  # 工作集是增益信息，失败不影响本轮请求
             log_with_context(
                 logger,
@@ -531,10 +570,13 @@ class SessionLoader:
         max_chars: int | None = None,
         author_edited_file_ids: set[str] | None = None,
         rendered_full_contents: dict[str, str] | None = None,
+        parts_out: dict[str, Any] | None = None,
     ) -> str:
         """渲染工作集文本块：最多 max_files 份全文、合计不超过 max_chars 字。
 
         rendered_full_contents：附了全文的文件记进去（file_id → 正文），作为本轮模型看到的正文快照。
+        parts_out：同一份工作集拆成 ``blocks``（附全文的文件，键 file:<id>，不带「上一轮已修改」
+        这类每轮都变的标注，标注放在 ``listing``）和 ``tail``（其余每轮照发的部分），供项目资料快照用。
         """
         from models import File
 
@@ -552,6 +594,7 @@ class SessionLoader:
         files_by_id = {str(f.id): f for f in files if getattr(f, "file_type", None) != "folder"}
 
         full_blocks: list[str] = []
+        snapshot_blocks: list[dict[str, str]] = []
         omitted: list[str] = []
         in_context: list[str] = []
         used_chars = 0
@@ -578,6 +621,11 @@ class SessionLoader:
                 full_blocks.append(
                     f"### {label} [全文，{count_words(content)} 字；{action}]\n{content}".rstrip()
                 )
+                snapshot_blocks.append({
+                    "key": f"file:{file.id}",
+                    "text": f"### 《{title}》 (id={file.id}) [全文，{count_words(content)} 字]\n{content}".rstrip(),
+                    "listing": f"- {label}（{action}，{count_words(content)} 字）",
+                })
                 if rendered_full_contents is not None:
                     rendered_full_contents[str(file.id)] = content
                 used_chars += len(content)
@@ -590,6 +638,7 @@ class SessionLoader:
         lines = ["<previous_turn_working_set>", WORKING_SET_HEADER, ""]
         for block in full_blocks:
             lines.extend([block, ""])
+        tail_start = len(lines)
         if in_context:
             lines.append("已在本轮上下文 <turn_context> 的项目上下文中标注[全文]（直接使用，不必重读）：")
             lines.extend(in_context)
@@ -601,6 +650,9 @@ class SessionLoader:
             )
             lines.extend(omitted)
             lines.append("")
+        if parts_out is not None:
+            parts_out["blocks"] = snapshot_blocks
+            parts_out["tail"] = "\n".join(lines[tail_start:]).strip()
         lines.append("</previous_turn_working_set>")
         return "\n".join(lines)
 
@@ -694,6 +746,15 @@ class SessionLoader:
         cursor_created_at = None
         cursor_id = None
         adaptive = page_size is None
+        # 会话里的消息序号（0 起）：历史窗口按序号对齐锚点。
+        next_ordinal = session.exec(
+            select(func.count()).select_from(ChatMessage).where(
+                and_(
+                    ChatMessage.session_id == chat_session_id,
+                    ChatMessage.role.in_(("user", "assistant")),
+                )
+            )
+        ).one() - 1
         read_page_size = (
             _HISTORY_INITIAL_PAGE_SIZE if adaptive else max(1, int(page_size or 200))
         )
@@ -727,6 +788,8 @@ class SessionLoader:
             stop = False
             for msg in page:
                 msg_data = self._format_chat_message_for_history(msg)
+                msg_data["ordinal"] = next_ordinal
+                next_ordinal -= 1
                 msg_tokens = max(1, estimate_message_tokens(msg_data))
 
                 if selected_reversed and used_tokens + msg_tokens > token_budget:
@@ -741,7 +804,7 @@ class SessionLoader:
                     break
 
             if stop:
-                break
+                return anchor_history_window(list(reversed(selected_reversed)))
 
             last = page[-1]
             cursor_created_at = last.created_at
@@ -1279,9 +1342,11 @@ class SessionLoader:
             if used_tokens >= token_budget:
                 break
 
-        return list(reversed(selected_reversed))
+        window = list(reversed(selected_reversed))
+        # 只有确实因预算截断时才对齐锚点；整段历史都放得下时起点就是会话开头，本来就稳定。
+        return anchor_history_window(window) if len(window) < len(messages) else window
 
-    async def load_session_with_compaction(
+    async def load_session_and_context(
         self,
         session: Session,
         context_assembler,
@@ -1295,8 +1360,7 @@ class SessionLoader:
         """
         Load chat session, assemble context and build the cross-turn working set.
 
-        名字是历史遗留：这里**不做**任何会话压缩/总结（从来没有 compaction 模块），
-        历史只是按 token 预算取最近的滑动窗口。为不破坏调用方与测试桩保留原名。
+        这里不做会话压缩/总结：历史按 token 预算取最近的窗口（起点对齐锚点，见 anchor_history_window）。
 
         This is the primary method for new code. It combines:
         1. Chat session loading (newest-first history window + working set refs)

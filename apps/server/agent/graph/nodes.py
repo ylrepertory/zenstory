@@ -25,7 +25,21 @@ from utils.logger import get_logger, log_with_context
 
 logger = get_logger(__name__)
 
-FAST_MODE_DIRECTIVE = "本轮为快速模式：写完直接结束，不要交接给 quality_reviewer 审稿。"
+# 每写完一个文件就结束这次运行，系统会重开一轮续写：多一次模型调用、重开处缓存命中下降。
+# 放在运行指令（输入最后一条消息）里，离模型做决定的位置最近，不动前缀缓存。
+WRITER_CHAIN_FILES_DIRECTIVE = (
+    "这一轮要写多个文件时，每写完一个 </file>，在同一次回复里直接调用 create_file 建下一个，"
+    "不要停在 </file> 等下一轮；全部写完后再写给作者的总结。"
+)
+FAST_MODE_DIRECTIVE = (
+    "本轮为快速模式，不送审：「稿件超过字数就交接给 quality_reviewer」「送审前只写一句进度」"
+    "这两条规则这一轮都不适用。不要调用 handoff_to_agent 交给 quality_reviewer；写完正文后由你"
+    "直接给作者写这一轮的总结（写了哪些文件、各多少字），原本要写进「[要告诉作者]」的话（如旧稿"
+    "可以在历史版本里找回、要问作者的问题）直接写在总结最后。作者在这条消息里要求审稿时，在总结"
+    "最后说明这一轮没有审稿，可以发消息要求审稿或切换到高质量模式。"
+)
+# 规划类角色在快速模式里照常把正文交给 writer，只是不送审。
+FAST_MODE_NON_WRITER_DIRECTIVE = "本轮为快速模式：不要交接给 quality_reviewer 审稿；其他交接照常。"
 
 # 完成标记：提示词要求 [TASK_COMPLETE]，但模型用中文回复时常写成 [任务完成]
 # （也有全角括号的写法）。两种都认作完成，否则以 [任务完成] 收尾的轮次不会结束，
@@ -66,6 +80,8 @@ def build_agent_directive(state: WritingState, agent_type: str) -> str:
     specialized = SPECIALIZED_PROMPTS.get(agent_type, "")
     if specialized:
         parts.append(f"## 当前角色：{agent_type}\n\n{specialized}")
+        if agent_type == "writer":
+            parts.append(f"## 连续写多个文件\n\n{WRITER_CHAIN_FILES_DIRECTIVE}")
 
     # 用户范围约束（由 writing_graph 按路由结果生成）：本轮每个 agent（含交接后的
     # writer / 审稿人）都能看到，且不会像改写 user_message 那样在会话历史里多出一条
@@ -83,6 +99,7 @@ def build_agent_directive(state: WritingState, agent_type: str) -> str:
     if agent_type == "writer" and length_requirements:
         parts.append(length_requirements)
 
+
     # 快速模式（前端「更快出结果」）：WRITER_PROMPT 的送审规则在这一轮不适用。
     # writing_graph 也会丢弃 writer → quality_reviewer 的交接，这里先让模型知道，
     # 免得它白白调用一次 handoff_to_agent。
@@ -90,7 +107,8 @@ def build_agent_directive(state: WritingState, agent_type: str) -> str:
         str(state.get("generation_mode") or "").strip().lower() == "fast"
         and agent_type != "quality_reviewer"
     ):
-        parts.append(f"## 本轮生成模式\n\n{FAST_MODE_DIRECTIVE}")
+        directive = FAST_MODE_DIRECTIVE if agent_type == "writer" else FAST_MODE_NON_WRITER_DIRECTIVE
+        parts.append(f"## 本轮生成模式\n\n{directive}")
 
     if len(parts) == 1:
         return ""
@@ -150,13 +168,6 @@ async def run_streaming_agent(
 # =============================================================================
 
 
-class ClarificationResult(NamedTuple):
-    """澄清检测结果。"""
-    needs_clarification: bool
-    confidence: float  # 0.0 - 1.0
-    reason: str
-
-
 class OutputEvaluationResult(NamedTuple):
     """Structured output evaluation result."""
 
@@ -212,34 +223,6 @@ def evaluate_agent_output(content: str, agent_type: str = "unknown") -> OutputEv
         should_complete=should_complete,
         should_clarify=should_clarify,
         reason=reason,
-    )
-
-
-def detect_clarification_needed(content: str, agent_type: str = "unknown") -> ClarificationResult:
-    """
-    Clarification must be triggered only by structured `request_clarification` tool calls.
-    Text heuristics and marker fallbacks are intentionally disabled.
-
-    Args:
-        content: Agent 输出内容（保留参数用于兼容，不参与判定）
-        agent_type: Agent 类型，用于特殊处理某些 agent 的输出格式
-
-    Returns:
-        ClarificationResult with needs_clarification flag, confidence, and reason
-    """
-    _ = content
-    # quality_reviewer 的输出是审查报告，不应触发澄清检测
-    if agent_type == "quality_reviewer":
-        return ClarificationResult(
-            needs_clarification=False,
-            confidence=0.0,
-            reason="quality_reviewer_exempt",
-        )
-
-    return ClarificationResult(
-        needs_clarification=False,
-        confidence=0.0,
-        reason="structured_tool_required",
     )
 
 

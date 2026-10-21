@@ -60,25 +60,6 @@ class ContextPriority(StrEnum):
         ]
 
 
-class ContextItemType(StrEnum):
-    """Types of context items."""
-
-    OUTLINE = "outline"
-    """Chapter/scene outline."""
-
-    DRAFT = "draft"
-    """Draft content."""
-
-    CHARACTER = "character"
-    """Character profile."""
-
-    LORE = "lore"
-    """World-building/lore entry."""
-
-    SNIPPET = "snippet"
-    """Reference snippet."""
-
-
 class ContextItem(BaseModel):
     """
     A single context item with metadata.
@@ -276,6 +257,11 @@ class ContextData(BaseModel):
     """
 
     context: str = Field(..., description="Formatted context string for prompt")
+
+    blocks: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="The same content as keyed blocks (header + one per item) for the context snapshot",
+    )
 
     items: list[dict[str, Any]] = Field(
         default_factory=list,
